@@ -1,0 +1,194 @@
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.optimizers import Adam
+from keras.regularizers import l2
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.metrics import r2_score
+import shap
+import tensorflow as tf
+
+#Random seed
+seed = 42
+np.random.seed(seed)
+tf.random.set_seed(seed)
+
+#  Load data
+res = pd.read_excel('U1-U9.xlsx')
+
+X = res.iloc[:, :18].values
+Y = res.iloc[:, 18:22].values
+
+# Training set: exclude the last 4 rows
+X_all_train = X[:-4]
+Y_all_train = Y[:-4]
+
+# Test set: the last 4 rows
+X_test = X[-4:]
+Y_test = Y[-4:]  
+
+# Normalization
+
+#  Model builder (re-create model each fold to avoid weight carryover)
+def build_model(initial_bias):
+    model = Sequential([
+        Dense(128, activation='relu', input_shape=(18,), kernel_regularizer=l2(0.001)),
+        Dense(128, activation='relu', kernel_regularizer=l2(0.001)),
+        Dense(128, activation='relu', kernel_regularizer=l2(0.001)),
+        Dense(
+            4,
+            activation='linear',
+            bias_initializer=tf.keras.initializers.Constant(initial_bias)
+        )
+    ])
+    model.compile(optimizer=Adam(), loss='mean_squared_error')
+    return model
+
+#  10-fold cross-validation
+kfold = KFold(n_splits=10, shuffle=True, random_state=seed)
+
+r2_scores_train_folds = []  
+r2_scores_val_folds = []   
+
+for fold, (train_idx, val_idx) in enumerate(kfold.split(X_all_train), start=1):
+    print(f"\n========== Fold {fold}/10 ==========")
+
+    X_tr_raw, X_val_raw = X_all_train[train_idx], X_all_train[val_idx]
+    Y_tr_raw, Y_val_raw = Y_all_train[train_idx], Y_all_train[val_idx]
+
+  
+    scaler_input = MinMaxScaler(feature_range=(0, 1))
+    X_tr = scaler_input.fit_transform(X_tr_raw)
+    X_val = scaler_input.transform(X_val_raw)
+
+    scaler_output = MinMaxScaler(feature_range=(0, 1))
+    Y_tr = scaler_output.fit_transform(Y_tr_raw)
+    Y_val = scaler_output.transform(Y_val_raw)
+
+    # Initialize output-layer bias using the mean of scaled training targets
+    initial_bias = np.mean(Y_tr, axis=0)
+
+    model = build_model(initial_bias)
+
+    history = model.fit(
+        X_tr, Y_tr,
+        epochs=500,
+        batch_size=128,
+        validation_data=(X_val, Y_val),
+        verbose=0
+    )
+
+    # Compute R² in the scaled space
+    Y_tr_pred = model.predict(X_tr, verbose=0)
+    Y_val_pred = model.predict(X_val, verbose=0)
+
+    r2_train = [r2_score(Y_tr[:, i], Y_tr_pred[:, i]) for i in range(Y_tr.shape[1])]
+    r2_val = [r2_score(Y_val[:, i], Y_val_pred[:, i]) for i in range(Y_val.shape[1])]
+
+    r2_scores_train_folds.append(r2_train)
+    r2_scores_val_folds.append(r2_val)
+
+    for i in range(4):
+        print(f"Output {i+1} - Train R²: {r2_train[i]:.4f}, Val R²: {r2_val[i]:.4f}")
+
+# Summarize 10-fold results: mean ± std
+r2_scores_train_folds = np.array(r2_scores_train_folds)  # (10,4)
+r2_scores_val_folds = np.array(r2_scores_val_folds)      # (10,4)
+
+print("\n========== 10-Fold CV Summary ==========")
+for i in range(4):
+    print(
+        f"Output {i+1} - "
+        f"Train R²: {r2_scores_train_folds[:, i].mean():.4f} ± {r2_scores_train_folds[:, i].std():.4f}, "
+        f"Val R²: {r2_scores_val_folds[:, i].mean():.4f} ± {r2_scores_val_folds[:, i].std():.4f}"
+    )
+
+# 5) Single final run: training + SHAP + test prediction
+
+scaler_input_final = MinMaxScaler(feature_range=(0, 1))
+X_train_normalized = scaler_input_final.fit_transform(X_all_train)
+X_test_normalized = scaler_input_final.transform(X_test)
+
+scaler_output_final = MinMaxScaler(feature_range=(0, 1))
+Y_train_normalized = scaler_output_final.fit_transform(Y_all_train)
+
+X_train, X_val, Y_train, Y_val = train_test_split(
+    X_train_normalized, Y_train_normalized, test_size=0.3, random_state=42
+)
+
+initial_bias = np.mean(Y_train, axis=0)
+model = build_model(initial_bias)
+
+model.summary()
+
+history = model.fit(
+    X_train, Y_train,
+    epochs=500,
+    batch_size=128,
+    validation_data=(X_val, Y_val),
+    verbose=1
+)
+
+Y_test_pred = model.predict(X_test_normalized, verbose=0)
+Y_test_pred_inverse = scaler_output_final.inverse_transform(Y_test_pred)
+
+feature_names = [
+    'V25','C25','V50','C50','V100','C100','V250','C250','V500','C500',
+    'V1000','C1000','V1500','C1500','V2000','C2000','V2250','C2250',
+]
+outputs = ['σ0', 'σa', 'A', 'E']
+
+print("\nPredictions for the last 4 rows (Test set):")
+predicted_df = pd.DataFrame(Y_test_pred_inverse, columns=outputs)
+print(predicted_df)
+
+# SHAP
+explainer = shap.Explainer(model, X_train, feature_names=feature_names)
+shap_values = explainer(X_val)
+
+for i in range(len(outputs)):
+    fig, ax1 = plt.subplots(figsize=(10, 8), dpi=1200)
+
+    shap.summary_plot(
+        shap_values[:, :, i].values,
+        X_val,
+        feature_names=feature_names,
+        plot_type="dot",
+        show=False,
+        color_bar=True,
+        cmap='viridis'
+    )
+    plt.gca().set_position([0.15, 0.15, 0.7, 0.7])
+    ax1 = plt.gca()
+
+    ax2 = ax1.twiny()
+
+    mean_abs_shap_values = np.abs(shap_values[:, :, i].values).mean(axis=0)
+    feature_importance_df = pd.DataFrame({
+        'Feature': feature_names,
+        'Mean SHAP Value': mean_abs_shap_values
+    }).sort_values(by='Mean SHAP Value', ascending=True)
+
+    sns.barplot(
+        x=feature_importance_df['Mean SHAP Value'],
+        y=feature_importance_df['Feature'],
+        ax=ax2,
+        color='lightblue',
+        alpha=0.6
+    )
+    ax2.axhline(y=len(feature_names) - 0.5, color='gray', linestyle='-', linewidth=1)
+
+    ax1.set_xlabel('Shapley Value Contribution (Bee Swarm)', fontsize=10)
+    ax2.set_xlabel('Mean Shapley Value (Feature Importance)', fontsize=10)
+    ax2.xaxis.set_label_position('top')
+    ax2.xaxis.tick_top()
+    ax1.set_ylabel('Features', fontsize=10)
+
+    plt.tight_layout()
+    plt.title(f'Combined SHAP Plot for Output: {outputs[i]}', y=1.05)
+    plt.savefig(f"SHAP_combined_output_{i+1}.pdf", format='pdf', bbox_inches='tight')
+    plt.show()
